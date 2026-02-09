@@ -3,7 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
-import { Upload, Loader2, FileUp, Paperclip, Send, ArrowDown, ChevronUp, ChevronDown, CornerDownLeft } from "lucide-react";
+import { Upload, Loader2, FileUp, Paperclip, Send, ArrowDown, ChevronUp, ChevronDown, CornerDownLeft, Copy } from "lucide-react";
 import { api } from "@/utils/api";
 import "@xterm/xterm/css/xterm.css";
 
@@ -27,6 +27,7 @@ const ClaudeTerminal = forwardRef<ClaudeTerminalHandle>((_props, ref) => {
   const [uploadInfo, setUploadInfo] = useState("");
   const [mobileInput, setMobileInput] = useState("");
   const [showInput, setShowInput] = useState(true);
+  const [copyFeedback, setCopyFeedback] = useState(false);
 
   useImperativeHandle(ref, () => ({
     sendCommand: (cmd: string) => {
@@ -61,6 +62,29 @@ const ClaudeTerminal = forwardRef<ClaudeTerminalHandle>((_props, ref) => {
   // Scroll terminal to bottom
   const handleScrollToBottom = useCallback(() => {
     termRef.current?.scrollToBottom();
+  }, []);
+
+  // Copy selected text from terminal
+  const handleCopy = useCallback(async () => {
+    const term = termRef.current;
+    if (!term) return;
+    const selection = term.getSelection();
+    if (selection) {
+      await navigator.clipboard.writeText(selection);
+    } else {
+      // No selection — copy last 100 lines of terminal buffer as fallback
+      const buffer = term.buffer.active;
+      const lines: string[] = [];
+      const start = Math.max(0, buffer.cursorY + buffer.baseY - 100);
+      const end = buffer.cursorY + buffer.baseY;
+      for (let i = start; i <= end; i++) {
+        const line = buffer.getLine(i);
+        if (line) lines.push(line.translateToString(true));
+      }
+      await navigator.clipboard.writeText(lines.join("\n").trimEnd());
+    }
+    setCopyFeedback(true);
+    setTimeout(() => setCopyFeedback(false), 1500);
   }, []);
 
   // Upload a file and type its path into the terminal
@@ -426,6 +450,18 @@ const ClaudeTerminal = forwardRef<ClaudeTerminalHandle>((_props, ref) => {
             title="Ctrl+C"
           >
             Ctrl+C
+          </button>
+          <button
+            onClick={handleCopy}
+            className={`flex items-center justify-center h-8 px-2.5 bg-gray-800 border rounded-md active:bg-gray-700 transition-colors text-xs gap-1 ${
+              copyFeedback
+                ? "border-green-600 text-green-400"
+                : "border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-500"
+            }`}
+            title="Copy selection (or recent output)"
+          >
+            <Copy size={13} />
+            <span>{copyFeedback ? "Copied!" : "Copy"}</span>
           </button>
           <div className="flex-1" />
           <button
