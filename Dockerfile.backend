@@ -1,0 +1,29 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install locale, Node.js, Claude Code CLI, terminal utilities
+RUN apt-get update && apt-get install -y curl procps less vim-tiny git locales && \
+    sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    npm install -g @anthropic-ai/claude-code && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# Create non-root user for running claude CLI with proper home directory
+# (claude --dangerously-skip-permissions refuses to run as root)
+RUN useradd -m -s /bin/bash -d /home/claude claude && \
+    mkdir -p /home/claude && \
+    echo '[ -f ~/.env ] && source ~/.env' >> /home/claude/.bashrc && \
+    chown -R claude:claude /home/claude
+
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend/ .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

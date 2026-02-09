@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./data:/app/data
+      - brain_data:/root/claude-brain
+      - upload_data:/home/claude/uploads
+      - /root/.claude:/home/claude/.claude
+      - /root/.ssh-claude:/home/claude/.ssh:ro
+    environment:
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-li}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-changeme_secure_password}
+      - JWT_SECRET=${JWT_SECRET:-changeme_jwt_secret}
+      - CLAUDE_BRAIN_PATH=/root/claude-brain
+      - UPLOAD_PATH=/home/claude/uploads
+      - DATABASE_PATH=/app/data/dashboard.db
+      - ALLOWED_ORIGINS=*
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS:-}
+      - TELEGRAM_DEFAULT_WORK_DIR=${TELEGRAM_DEFAULT_WORK_DIR:-/home/li/projects}
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "3001:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  brain_data:
+  upload_data:
