@@ -24,7 +24,7 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS:-}
-      - TELEGRAM_DEFAULT_WORK_DIR=${TELEGRAM_DEFAULT_WORK_DIR:-/home/li/projects}
+      - TELEGRAM_DEFAULT_WORK_DIR=${TELEGRAM_DEFAULT_WORK_DIR:-/home/claude}
     restart: unless-stopped
 
   frontend:

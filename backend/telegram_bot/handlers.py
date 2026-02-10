@@ -20,18 +20,41 @@ logger = logging.getLogger(__name__)
 _user_work_dirs: dict[int, str] = {}
 _active_tasks: dict[int, asyncio.Task] = {}
 
+# Global auth process — must stay alive for OAuth callback
+_auth_process: asyncio.subprocess.Process | None = None
+_auth_wait_task: asyncio.Task | None = None
+
 
 # --------------- Claude Code Auth Helpers ---------------
 
 def _extract_urls(text: str) -> list[str]:
     """Extract URLs from text (for capturing OAuth links)."""
-    return re_module.findall(r'https?://[^\s<>"\']+', text)
+    return re_module.findall(r'https?://[^\s<>"\')\]]+', text)
+
+
+def _is_auth_error(text: str) -> bool:
+    """Check if text indicates an authentication error."""
+    lower = text.lower()
+    auth_patterns = [
+        "not logged in",
+        "please run /login",
+        "unauthorized",
+        "token expired",
+        "authentication required",
+        "auth",
+        "login required",
+        "401",
+        "403",
+        "credential",
+        "not authenticated",
+    ]
+    return any(p in lower for p in auth_patterns)
 
 
 async def _check_claude_auth() -> dict:
     """
-    Check if Claude Code CLI is authenticated.
-    Returns {"ok": True/False, "detail": str, "auth_url": str|None}
+    Quick check if Claude Code CLI is authenticated.
+    Returns {"ok": True/False, "detail": str}
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -41,82 +64,121 @@ async def _check_claude_auth() -> dict:
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        stdout_text = stdout.decode("utf-8", errors="replace")
-        stderr_text = stderr.decode("utf-8", errors="replace")
 
         if proc.returncode == 0:
-            return {"ok": True, "detail": "Claude Code is authenticated and working.", "auth_url": None}
+            return {"ok": True, "detail": "Authenticated and working."}
 
-        # Auth failure - look for OAuth URL in output
-        combined = stdout_text + "\n" + stderr_text
-        urls = _extract_urls(combined)
-        auth_url = None
-        for url in urls:
-            if "anthropic.com" in url or "claude.ai" in url or "oauth" in url.lower() or "login" in url.lower() or "auth" in url.lower():
-                auth_url = url
-                break
-
-        # Check for common auth error messages
-        auth_keywords = ["unauthorized", "auth", "token", "expired", "login", "credential", "401", "403"]
-        is_auth_error = any(kw in combined.lower() for kw in auth_keywords)
-
-        if is_auth_error:
-            return {
-                "ok": False,
-                "detail": f"Authentication failed.\n\n{stderr_text[:500]}",
-                "auth_url": auth_url,
-            }
-        else:
-            return {
-                "ok": False,
-                "detail": f"Claude Code error (exit code {proc.returncode}):\n{stderr_text[:500]}",
-                "auth_url": auth_url,
-            }
+        combined = stdout.decode("utf-8", errors="replace") + "\n" + stderr.decode("utf-8", errors="replace")
+        return {"ok": False, "detail": combined.strip()[:500]}
 
     except asyncio.TimeoutError:
-        return {"ok": False, "detail": "Claude Code timed out (30s). It may be hanging on an auth prompt.", "auth_url": None}
+        return {"ok": False, "detail": "Timed out (30s). May be stuck on an auth prompt."}
     except FileNotFoundError:
-        return {"ok": False, "detail": "Claude Code CLI not found. Is it installed?", "auth_url": None}
+        return {"ok": False, "detail": "Claude Code CLI not found. Is it installed?"}
     except Exception as e:
-        return {"ok": False, "detail": f"Error checking auth: {str(e)}", "auth_url": None}
+        return {"ok": False, "detail": f"Error: {str(e)}"}
 
 
-async def _trigger_reauth() -> dict:
+async def _trigger_reauth(notify_chat_id: int = None, bot=None) -> dict:
     """
-    Trigger Claude Code re-authentication and capture the OAuth URL.
+    Run 'claude auth login', capture the OAuth URL, and keep the process
+    alive so the OAuth callback can complete.
+
     Returns {"auth_url": str|None, "output": str}
     """
+    global _auth_process, _auth_wait_task
+
+    # Kill any previous auth process
+    if _auth_process and _auth_process.returncode is None:
+        try:
+            _auth_process.kill()
+        except ProcessLookupError:
+            pass
+
+    env = os.environ.copy()
+    # Prevent CLI from trying to open a browser
+    env["BROWSER"] = "echo"
+    env.pop("DISPLAY", None)
+
     try:
-        # Try 'claude auth login' to get OAuth URL
         proc = await asyncio.create_subprocess_exec(
             "claude", "auth", "login",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE,
+            env=env,
         )
-        # Give it a few seconds to output the URL, then kill it
-        # (it would otherwise wait for browser callback)
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(input=b""), timeout=15)
-        except asyncio.TimeoutError:
-            proc.kill()
-            stdout, stderr = await proc.communicate()
-
-        combined = (stdout or b"").decode("utf-8", errors="replace") + "\n" + (stderr or b"").decode("utf-8", errors="replace")
-        urls = _extract_urls(combined)
-
-        auth_url = None
-        for url in urls:
-            if "anthropic.com" in url or "claude.ai" in url or "oauth" in url.lower() or "login" in url.lower():
-                auth_url = url
-                break
-
-        return {"auth_url": auth_url, "output": combined.strip()}
-
     except FileNotFoundError:
         return {"auth_url": None, "output": "Claude Code CLI not found."}
-    except Exception as e:
-        return {"auth_url": None, "output": f"Error: {str(e)}"}
+
+    _auth_process = proc
+
+    # Collect output and look for URL
+    auth_url = None
+    all_output = []
+    url_found = asyncio.Event()
+
+    async def _read_stream(stream):
+        nonlocal auth_url
+        try:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace")
+                all_output.append(text)
+                logger.info(f"claude auth: {text.strip()}")
+                if auth_url is None:
+                    urls = _extract_urls(text)
+                    if urls:
+                        auth_url = urls[0]
+                        url_found.set()
+        except Exception:
+            pass
+
+    read_stdout = asyncio.create_task(_read_stream(proc.stdout))
+    read_stderr = asyncio.create_task(_read_stream(proc.stderr))
+
+    # Wait up to 15s for a URL to appear in output
+    try:
+        await asyncio.wait_for(url_found.wait(), timeout=15)
+    except asyncio.TimeoutError:
+        pass
+
+    if auth_url:
+        # URL found — keep process alive for up to 5 minutes for OAuth callback
+        async def _wait_for_callback():
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=300)
+                await asyncio.gather(read_stdout, read_stderr, return_exceptions=True)
+                if proc.returncode == 0:
+                    logger.info("Claude OAuth completed successfully!")
+                    if notify_chat_id and bot:
+                        try:
+                            await bot.send_message(
+                                chat_id=notify_chat_id,
+                                text="Login successful! You can send messages now.",
+                            )
+                        except Exception:
+                            pass
+                else:
+                    logger.warning(f"claude auth login exited with code {proc.returncode}")
+            except asyncio.TimeoutError:
+                logger.warning("Auth process timed out after 5 minutes, killing.")
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+
+        _auth_wait_task = asyncio.create_task(_wait_for_callback())
+        return {"auth_url": auth_url, "output": "".join(all_output).strip()}
+    else:
+        # No URL found, clean up
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await asyncio.gather(read_stdout, read_stderr, return_exceptions=True)
+        return {"auth_url": None, "output": "".join(all_output).strip() or "No auth URL found in CLI output."}
 
 
 def _get_work_dir(user_id: int) -> str:
@@ -293,7 +355,7 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def auth_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /auth command - check and refresh Claude Code authentication."""
+    """Handle /auth or /login command — check auth and send OAuth link if needed."""
     if not _auth_check(update.effective_user.id):
         await update.message.reply_text("Unauthorized.")
         return
@@ -303,33 +365,26 @@ async def auth_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = await _check_claude_auth()
 
     if result["ok"]:
-        await update.message.reply_text("Claude Code auth OK.")
+        await update.message.reply_text("Claude Code is authenticated and working!")
         return
 
-    # Auth failed - show details
-    msg = f"Auth issue detected:\n{result['detail']}"
+    # Not authenticated — trigger login and get URL
+    await update.message.reply_text("Not authenticated. Getting login link...")
 
-    if result["auth_url"]:
-        msg += f"\n\nClick to re-authenticate:\n{result['auth_url']}"
-        await update.message.reply_text(msg)
-        return
-
-    # No URL found from check, try triggering re-auth
-    await update.message.reply_text(msg + "\n\nAttempting to get re-auth link...")
-    reauth = await _trigger_reauth()
+    chat_id = update.effective_chat.id
+    reauth = await _trigger_reauth(notify_chat_id=chat_id, bot=context.bot)
 
     if reauth["auth_url"]:
-        await update.message.reply_text(f"Click to re-authenticate:\n{reauth['auth_url']}")
-    else:
-        tip = (
-            "Could not get an auto-login link.\n\n"
-            "Options:\n"
-            "1. SSH into the server and run: claude auth login\n"
-            "2. Set ANTHROPIC_API_KEY in .env (no OAuth needed)\n"
+        await update.message.reply_text(
+            "Open this link in your browser to log in:\n\n"
+            f"{reauth['auth_url']}\n\n"
+            "After you log in, I'll notify you automatically."
         )
+    else:
+        msg = "Could not get a login link.\n\n"
         if reauth["output"]:
-            tip += f"\nCLI output:\n{reauth['output'][:500]}"
-        await update.message.reply_text(tip)
+            msg += f"CLI output:\n{reauth['output'][:500]}"
+        await update.message.reply_text(msg)
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -378,34 +433,33 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not response.strip():
                 response = "(No output from Claude Code)"
 
-            # Detect auth errors in the response
-            auth_keywords = ["unauthorized", "token expired", "authentication", "401", "403", "auth"]
-            response_lower = response.lower()
-            is_auth_error = any(kw in response_lower for kw in auth_keywords) and ("error" in response_lower or "fail" in response_lower)
-
             # Delete the "Processing..." message
             try:
                 await status_msg.delete()
             except Exception:
                 pass
 
-            if is_auth_error:
-                # Auto-detect and push re-auth link
-                urls = _extract_urls(response)
-                auth_url = None
-                for url in urls:
-                    if "anthropic.com" in url or "claude.ai" in url or "oauth" in url.lower():
-                        auth_url = url
-                        break
+            # Detect auth errors and auto-trigger login
+            if _is_auth_error(response):
+                await update.message.reply_text(
+                    "Claude Code is not logged in. Getting login link..."
+                )
+                chat_id = update.effective_chat.id
+                reauth = await _trigger_reauth(notify_chat_id=chat_id, bot=context.bot)
 
-                msg = "Claude Code authentication issue detected.\n"
-                if auth_url:
-                    msg += f"\nClick to re-authenticate:\n{auth_url}"
+                if reauth["auth_url"]:
+                    await update.message.reply_text(
+                        "Open this link in your browser to log in:\n\n"
+                        f"{reauth['auth_url']}\n\n"
+                        "After you log in, resend your message."
+                    )
                 else:
-                    msg += "\nRun /auth to check status and get a re-auth link."
-                await update.message.reply_text(msg)
-                # Still send the original response for context
-                await _send_long_text(update, response)
+                    await update.message.reply_text(
+                        "Could not get login link. Run /auth to try again.\n\n"
+                        f"CLI output:\n{reauth['output'][:300]}"
+                    )
+                return
+
             else:
                 # Send the response
                 await _send_long_text(update, response)
@@ -416,6 +470,19 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.CancelledError:
             try:
                 await status_msg.edit_text("Task cancelled.")
+            except Exception:
+                pass
+        except FileNotFoundError as e:
+            logger.error(f"Claude Code not found: {e}")
+            try:
+                error_msg = (
+                    "Claude Code CLI not found.\n\n"
+                    "Please install it:\n"
+                    "npm install -g @anthropic-ai/claude-code\n\n"
+                    "Or check that the working directory exists:\n"
+                    f"{_get_work_dir(user_id)}"
+                )
+                await status_msg.edit_text(error_msg)
             except Exception:
                 pass
         except Exception as e:

@@ -1,8 +1,11 @@
 import asyncio
 import json
+import logging
 import os
 import pwd
 from typing import AsyncGenerator, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def _get_claude_user():
@@ -111,14 +114,29 @@ async def call_claude_code(
         env["HOME"] = "/home/claude"
         env["USER"] = "claude"
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=working_dir,
-        preexec_fn=_demote if uid is not None else None,
-        env=env,
-    )
+    # Ensure working directory exists, fallback to home dir
+    if working_dir and not os.path.isdir(working_dir):
+        try:
+            os.makedirs(working_dir, exist_ok=True)
+        except OSError:
+            # Cannot create dir, fallback to a safe default
+            working_dir = env.get("HOME", os.path.expanduser("~"))
+
+    if not working_dir or not os.path.isdir(working_dir):
+        working_dir = env.get("HOME", os.path.expanduser("~"))
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_dir,
+            preexec_fn=_demote if uid is not None else None,
+            env=env,
+        )
+    except FileNotFoundError:
+        yield ("Claude Code CLI not found. Please install it: npm install -g @anthropic-ai/claude-code", "error")
+        return
 
     buffer = ""
     while True:

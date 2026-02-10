@@ -44,6 +44,7 @@ async def start_telegram_bot():
     app.add_handler(CommandHandler("status", status_handler))
     app.add_handler(CommandHandler("cancel", cancel_handler))
     app.add_handler(CommandHandler("auth", auth_handler))
+    app.add_handler(CommandHandler("login", auth_handler))
 
     # Register message handlers
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
