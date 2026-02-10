@@ -94,7 +94,7 @@ def _parse_stream_event(line: str) -> list[Tuple[str, str]]:
 
 
 async def call_claude_code(
-    prompt: str, working_dir: str = None
+    prompt: str, working_dir: str = None, continue_session: bool = False
 ) -> AsyncGenerator[Tuple[str, str], None]:
     """
     Call Claude Code CLI with stream-json output and yield (chunk, type) tuples.
@@ -108,6 +108,8 @@ async def call_claude_code(
             os.setuid(uid)
 
     cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
+    if continue_session:
+        cmd.append("--continue")
 
     env = os.environ.copy()
     if uid is not None:

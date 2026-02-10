@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # Per-user state
 _user_work_dirs: dict[int, str] = {}
 _active_tasks: dict[int, asyncio.Task] = {}
+_user_new_session: dict[int, bool] = {}  # True = next message starts fresh (no --continue)
 
 # Global auth process — must stay alive for OAuth callback
 _auth_process: asyncio.subprocess.Process | None = None
@@ -216,6 +217,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Claude Code Telegram Bot\n\n"
         "Send me any message, I'll forward it to Claude Code on your server.\n\n"
         "Commands:\n"
+        "/new - Start a new conversation (clear context)\n"
         "/cd <path> - Switch working directory\n"
         "/pwd - Show current working directory\n"
         "/projects - List available projects\n"
@@ -338,6 +340,16 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def new_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /new command — start a fresh conversation (clear context)."""
+    if not _auth_check(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    _user_new_session[update.effective_user.id] = True
+    await update.message.reply_text("Context cleared. Next message starts a new conversation.")
+
+
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /cancel command."""
     if not _auth_check(update.effective_user.id):
@@ -415,13 +427,18 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             work_dir = _get_work_dir(user_id)
-            full_prompt = build_context_prompt(content, is_first_message=True)
+
+            # Determine if we should continue the previous conversation
+            start_fresh = _user_new_session.pop(user_id, False)
+            use_continue = not start_fresh
+
+            full_prompt = build_context_prompt(content, is_first_message=start_fresh)
 
             # Collect the full output
             final_result = ""
             full_output_parts = []
 
-            async for chunk_text, chunk_type in call_claude_code(full_prompt, working_dir=work_dir):
+            async for chunk_text, chunk_type in call_claude_code(full_prompt, working_dir=work_dir, continue_session=use_continue):
                 if chunk_type == "result":
                     final_result = chunk_text
                 elif chunk_type in ("text", "tool_use", "tool_result", "error"):

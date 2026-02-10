@@ -10,6 +10,7 @@ from config import settings
 from telegram_bot.handlers import (
     start_handler,
     help_handler,
+    new_handler,
     pwd_handler,
     cd_handler,
     projects_handler,
@@ -38,6 +39,7 @@ async def start_telegram_bot():
     # Register command handlers
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", help_handler))
+    app.add_handler(CommandHandler("new", new_handler))
     app.add_handler(CommandHandler("pwd", pwd_handler))
     app.add_handler(CommandHandler("cd", cd_handler))
     app.add_handler(CommandHandler("projects", projects_handler))
